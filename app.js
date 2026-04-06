@@ -1,700 +1,971 @@
-const { createClient } = window.supabase;
-
-const DEFAULT_CATEGORIES = [
-  "Loyer",
-  "Courses",
-  "Transport",
-  "Santé",
-  "Factures",
-  "Loisirs",
-  "Épargne",
-  "Divers"
-];
+const APP_NAME = 'Budget Flow V4 Premium';
+const DB_NAME = 'budget-flow-v4-db';
+const DB_STORE = 'app_state';
+const DB_KEY = 'singleton';
+const FALLBACK_KEY = 'budget-flow-v4-fallback';
+const currency = new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR' });
+const monthFmt = new Intl.DateTimeFormat('fr-FR', { month: 'long', year: 'numeric' });
+const monthShortFmt = new Intl.DateTimeFormat('fr-FR', { month: 'short' });
+const defaultCategories = ['Logement', 'Courses', 'Transport', 'Santé', 'Énergie', 'Télécom', 'Loisirs', 'Assurance', 'Épargne', 'Autre'];
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => [...document.querySelectorAll(s)];
+let deferredPrompt = null;
+let supabaseClient = null;
 
 const state = {
-  supabase: null,
-  session: null,
-  data: null,
-  activeAccountId: null,
-  activeMonth: null,
-  filters: { search: "", category: "all", status: "all" },
-  saveTimer: null,
-  theme: localStorage.getItem("budgetflow_theme") || "dark",
+  theme: 'dark',
+  settings: {
+    supabaseUrl: '',
+    supabaseAnonKey: '',
+    cloudEnabled: false,
+    lastCloudSyncAt: null,
+    lastLocalSaveAt: null,
+  },
+  selectedAccountId: null,
+  selectedMonthKey: currentMonthKey(),
+  accounts: [],
 };
 
-const els = {};
-
-document.addEventListener("DOMContentLoaded", init);
-
-function init() {
-  bindEls();
-  applyTheme(state.theme);
-  restoreConfig();
-  wireAuth();
-  wireApp();
-  registerServiceWorker();
-}
-
-function bindEls() {
-  [
-    "authView","appView","supabaseUrl","supabaseAnonKey","saveConfigBtn","testConfigBtn","emailInput","passwordInput","signInBtn","signUpBtn",
-    "themeToggle","signOutBtn","accountSelect","monthSelect","dashboardTitle","statsGrid","spendRateLabel","spendRateBar","plannedList",
-    "incomeList","unexpectedList","searchInput","categoryFilter","statusFilter","monthlyNotes","openingBalanceInput","monthlyTargetInput",
-    "saveMonthSettingsBtn","syncNowBtn","duplicateMonthBtn","newAccountBtn","addIncomeBtn","addPlannedBtn","addUnexpectedBtn","addIncomeBtn2",
-    "addPlannedBtn2","addUnexpectedBtn2","manageCategoriesBtn","annualChart","annualSummary","reloadCloudBtn","saveCloudBtn","syncStateLabel",
-    "syncStateText","importJsonInput","exportJsonBtn","exportCsvBtn","modalRoot","toast"
-  ].forEach(id => els[id] = document.getElementById(id));
-
-  document.querySelectorAll(".tab-btn").forEach(btn => {
-    btn.addEventListener("click", () => {
-      document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
-      document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
-      btn.classList.add("active");
-      document.getElementById(btn.dataset.tab).classList.add("active");
-      if (btn.dataset.tab === "annualTab") renderAnnual();
+const idb = {
+  open() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB_NAME, 1);
+      request.onupgradeneeded = () => request.result.createObjectStore(DB_STORE);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
     });
-  });
-}
-
-function wireAuth() {
-  els.saveConfigBtn.addEventListener("click", saveConfig);
-  els.testConfigBtn.addEventListener("click", testConfig);
-  els.signInBtn.addEventListener("click", signIn);
-  els.signUpBtn.addEventListener("click", signUp);
-  els.signOutBtn.addEventListener("click", signOut);
-  els.themeToggle.addEventListener("click", () => {
-    const next = document.body.classList.contains("light") ? "dark" : "light";
-    applyTheme(next);
-  });
-
-  if (buildClient()) {
-    state.supabase.auth.getSession().then(({ data }) => {
-      if (data.session) handleSession(data.session);
-    });
-    state.supabase.auth.onAuthStateChange((_event, session) => {
-      if (session) handleSession(session);
-      else showAuth();
-    });
+  },
+  async get() {
+    try {
+      const db = await this.open();
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(DB_STORE, 'readonly');
+        const req = tx.objectStore(DB_STORE).get(DB_KEY);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+      });
+    } catch {
+      const raw = localStorage.getItem(FALLBACK_KEY);
+      return raw ? JSON.parse(raw) : null;
+    }
+  },
+  async set(value) {
+    try {
+      const db = await this.open();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(DB_STORE, 'readwrite');
+        tx.objectStore(DB_STORE).put(value, DB_KEY);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch {
+      localStorage.setItem(FALLBACK_KEY, JSON.stringify(value));
+    }
+  },
+  async clear() {
+    try {
+      const db = await this.open();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(DB_STORE, 'readwrite');
+        tx.objectStore(DB_STORE).clear();
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch {}
+    localStorage.removeItem(FALLBACK_KEY);
   }
-}
+};
 
-function wireApp() {
-  els.accountSelect.addEventListener("change", () => {
-    state.activeAccountId = els.accountSelect.value;
-    ensureActiveMonth();
-    render();
-  });
-  els.monthSelect.addEventListener("change", () => {
-    state.activeMonth = els.monthSelect.value;
-    render();
-  });
-  els.searchInput.addEventListener("input", e => { state.filters.search = e.target.value.trim().toLowerCase(); renderLists(); });
-  els.categoryFilter.addEventListener("change", e => { state.filters.category = e.target.value; renderLists(); });
-  els.statusFilter.addEventListener("change", e => { state.filters.status = e.target.value; renderLists(); });
-  els.monthlyNotes.addEventListener("input", () => { getCurrentMonthData().notes = els.monthlyNotes.value; scheduleSave("Notes mises à jour"); });
-  els.saveMonthSettingsBtn.addEventListener("click", saveMonthSettings);
-  els.syncNowBtn.addEventListener("click", () => saveRemote(true));
-  els.saveCloudBtn.addEventListener("click", () => saveRemote(true));
-  els.reloadCloudBtn.addEventListener("click", loadRemote);
-  els.duplicateMonthBtn.addEventListener("click", duplicateMonthForward);
-  els.newAccountBtn.addEventListener("click", () => openAccountModal());
-  [els.addIncomeBtn, els.addIncomeBtn2].forEach(btn => btn.addEventListener("click", () => openEntryModal("income")));
-  [els.addPlannedBtn, els.addPlannedBtn2].forEach(btn => btn.addEventListener("click", () => openEntryModal("planned")));
-  [els.addUnexpectedBtn, els.addUnexpectedBtn2].forEach(btn => btn.addEventListener("click", () => openEntryModal("unexpected")));
-  els.manageCategoriesBtn.addEventListener("click", openCategoriesModal);
-  els.exportJsonBtn.addEventListener("click", exportJson);
-  els.exportCsvBtn.addEventListener("click", exportAnnualCsv);
-  els.importJsonInput.addEventListener("change", importJson);
+function uid() {
+  return (crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
 }
-
-function applyTheme(theme) {
-  state.theme = theme;
-  document.body.classList.toggle("light", theme === "light");
-  localStorage.setItem("budgetflow_theme", theme);
+function parseAmount(value) {
+  const n = Number(String(value).replace(',', '.'));
+  return Number.isFinite(n) ? Number(n.toFixed(2)) : 0;
 }
-
-function restoreConfig() {
-  els.supabaseUrl.value = localStorage.getItem("budgetflow_supabase_url") || "";
-  els.supabaseAnonKey.value = localStorage.getItem("budgetflow_supabase_anon") || "";
+function formatEuro(value) { return currency.format(Number(value || 0)); }
+function currentMonthKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
-
-function saveConfig() {
-  localStorage.setItem("budgetflow_supabase_url", els.supabaseUrl.value.trim());
-  localStorage.setItem("budgetflow_supabase_anon", els.supabaseAnonKey.value.trim());
-  if (buildClient()) {
-    toast("Configuration enregistrée");
-  }
+function monthToDate(key) {
+  const [y, m] = key.split('-').map(Number);
+  return new Date(y, m - 1, 1);
 }
-
-function buildClient() {
-  const url = els.supabaseUrl.value.trim();
-  const key = els.supabaseAnonKey.value.trim();
-  if (!url || !key) return false;
-  try {
-    state.supabase = createClient(url, key, {
-      auth: { persistSession: true, autoRefreshToken: true }
-    });
-    return true;
-  } catch (e) {
-    toast("Configuration Supabase invalide");
-    return false;
-  }
+function formatMonth(key) { return monthFmt.format(monthToDate(key)); }
+function nextMonthKey(key) {
+  const d = monthToDate(key);
+  d.setMonth(d.getMonth() + 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
-
-async function testConfig() {
-  if (!buildClient()) return toast("Ajoute l’URL et la clé anon");
-  const { error } = await state.supabase.from("budget_snapshots").select("updated_at").limit(1);
-  toast(error ? `Connexion OK, mais table/policies à vérifier` : "Connexion Supabase OK");
+function previousMonthKey(key) {
+  const d = monthToDate(key);
+  d.setMonth(d.getMonth() - 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
-
-async function signUp() {
-  if (!buildClient()) return toast("Enregistre d’abord la config Supabase");
-  const email = els.emailInput.value.trim();
-  const password = els.passwordInput.value;
-  if (!email || !password) return toast("Email et mot de passe requis");
-  const { error } = await state.supabase.auth.signUp({ email, password });
-  if (error) return toast(error.message);
-  toast("Compte créé. Vérifie tes emails si confirmation activée.");
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
+function sum(items, key = 'amount') { return items.reduce((acc, item) => acc + Number(item[key] || 0), 0); }
+function clone(obj) { return JSON.parse(JSON.stringify(obj)); }
+function sortedMonthKeys(months) { return Object.keys(months).sort((a, b) => a.localeCompare(b)); }
 
-async function signIn() {
-  if (!buildClient()) return toast("Enregistre d’abord la config Supabase");
-  const email = els.emailInput.value.trim();
-  const password = els.passwordInput.value;
-  const { data, error } = await state.supabase.auth.signInWithPassword({ email, password });
-  if (error) return toast(error.message);
-  handleSession(data.session);
-}
-
-async function signOut() {
-  await state.supabase?.auth.signOut();
-  state.session = null;
-  state.data = null;
-  showAuth();
-}
-
-async function handleSession(session) {
-  state.session = session;
-  els.signOutBtn.classList.remove("hidden");
-  showApp();
-  await loadRemote();
-}
-
-function showAuth() {
-  els.authView.classList.remove("hidden");
-  els.appView.classList.add("hidden");
-  els.signOutBtn.classList.add("hidden");
-}
-
-function showApp() {
-  els.authView.classList.add("hidden");
-  els.appView.classList.remove("hidden");
-}
-
-function defaultData() {
-  const month = monthKey(new Date());
-  const accountId = crypto.randomUUID();
+function defaultMonth(key) {
   return {
-    version: 1,
-    categories: [...DEFAULT_CATEGORIES],
-    accounts: [{ id: accountId, name: "Compte personnel", color: "#6d8cff", monthlyTarget: 0, months: { [month]: makeEmptyMonth() } }],
-    meta: { createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
-  };
-}
-
-function makeEmptyMonth(fromPrevious = null) {
-  return {
-    openingBalance: fromPrevious?.carryOver ?? 0,
-    monthlyTarget: fromPrevious?.monthlyTarget ?? 0,
-    incomes: [],
-    planned: (fromPrevious?.planned || []).filter(i => i.recurring).map(i => ({ ...i, id: crypto.randomUUID(), paid: false })),
+    key,
+    openingBalance: 0,
+    carryOverEnabled: true,
+    carryOverAmount: 0,
+    income: [],
+    planned: [],
     unexpected: [],
-    notes: ""
+    notes: '',
+    archived: false,
+    categoryBudgets: {}
+  };
+}
+function defaultAccount(name = 'Compte principal') {
+  const key = currentMonthKey();
+  return {
+    id: uid(),
+    name,
+    color: '#7c9cff',
+    monthlyTarget: 0,
+    categories: [...defaultCategories],
+    months: { [key]: defaultMonth(key) }
   };
 }
 
-async function loadRemote() {
-  if (!state.supabase || !state.session?.user) return;
-  setSyncState("Chargement...", "Récupération des données cloud...");
-  const userId = state.session.user.id;
-  const { data, error } = await state.supabase.from("budget_snapshots").select("payload, updated_at").eq("user_id", userId).maybeSingle();
-  if (error) {
-    setSyncState("Erreur cloud", error.message);
-    return toast(error.message);
+async function bootstrap() {
+  const saved = await idb.get();
+  if (saved && saved.accounts?.length) Object.assign(state, saved);
+  if (!state.accounts.length) {
+    const account = defaultAccount();
+    state.accounts.push(account);
+    state.selectedAccountId = account.id;
+    state.selectedMonthKey = currentMonthKey();
+    ensureMonth(getAccount(), state.selectedMonthKey, false);
+    await persist();
   }
-  state.data = data?.payload || defaultData();
-  touchMeta();
-  normalizeData();
-  state.activeAccountId ||= state.data.accounts[0]?.id;
-  ensureActiveMonth();
-  render();
-  setSyncState("Synchronisé", data?.updated_at ? `Dernière synchro: ${formatDateTime(data.updated_at)}` : "Première session prête");
-  if (!data) await saveRemote();
+  if (!state.selectedAccountId || !getAccount()) state.selectedAccountId = state.accounts[0]?.id || null;
+  ensureMonth(getAccount(), state.selectedMonthKey, false);
+  applyTheme();
+  bindUI();
+  maybeInitSupabase();
+  renderAll();
+  registerPWA();
 }
 
-async function saveRemote(forceToast = false) {
-  if (!state.supabase || !state.session?.user || !state.data) return;
-  touchMeta();
-  const payload = structuredClone(state.data);
-  const { error } = await state.supabase.from("budget_snapshots").upsert({
-    user_id: state.session.user.id,
-    payload,
-    updated_at: new Date().toISOString()
+function getAccount() { return state.accounts.find(a => a.id === state.selectedAccountId) || state.accounts[0] || null; }
+function getMonth(account = getAccount(), key = state.selectedMonthKey) {
+  if (!account) return null;
+  ensureMonth(account, key, false);
+  return account.months[key];
+}
+function ensureMonth(account, key, cloneFromPrevious = false) {
+  if (!account || !key) return null;
+  if (!account.months[key]) {
+    const month = defaultMonth(key);
+    if (cloneFromPrevious) {
+      const prev = account.months[previousMonthKey(key)];
+      if (prev) {
+        month.openingBalance = 0;
+        month.carryOverEnabled = prev.carryOverEnabled;
+        month.categoryBudgets = clone(prev.categoryBudgets || {});
+        month.planned = prev.planned
+          .filter(item => item.recurring === 'monthly' || (item.recurring === 'yearly' && item.date?.slice(5, 7) === key.slice(5, 7)))
+          .map(item => ({ ...clone(item), id: uid(), checked: false }));
+      }
+    }
+    account.months[key] = month;
+  }
+  recomputeCarryOver(account, key);
+  return account.months[key];
+}
+function recomputeCarryOver(account, key) {
+  const month = account.months[key];
+  if (!month) return;
+  if (!month.carryOverEnabled) {
+    month.carryOverAmount = 0;
+    return;
+  }
+  const prev = account.months[previousMonthKey(key)];
+  month.carryOverAmount = prev ? computeMonthMetrics(prev).remaining : 0;
+}
+
+function computeMonthMetrics(month) {
+  const income = sum(month.income);
+  const plannedTotal = sum(month.planned);
+  const plannedPaid = sum(month.planned.filter(x => x.checked));
+  const unexpected = sum(month.unexpected);
+  const available = Number(month.openingBalance || 0) + Number(month.carryOverAmount || 0) + income;
+  const remaining = available - plannedPaid - unexpected;
+  return {
+    income,
+    plannedTotal,
+    plannedPaid,
+    unexpected,
+    available,
+    remaining,
+    pending: plannedTotal - plannedPaid,
+    plannedCount: month.planned.length,
+    paidCount: month.planned.filter(x => x.checked).length,
+  };
+}
+
+async function persist() {
+  state.settings.lastLocalSaveAt = new Date().toISOString();
+  await idb.set(clone(state));
+  renderStorageInfo();
+}
+
+function applyTheme() {
+  document.body.classList.toggle('light', state.theme === 'light');
+}
+
+function bindUI() {
+  $('#themeBtn').onclick = async () => {
+    state.theme = state.theme === 'dark' ? 'light' : 'dark';
+    applyTheme();
+    await persist();
+  };
+  $('#addAccountBtn').onclick = addAccount;
+  $('#newMonthBtn').onclick = createMonth;
+  $('#duplicateMonthBtn').onclick = duplicateMonth;
+  $('#accountSelect').onchange = async (e) => { state.selectedAccountId = e.target.value; ensureMonth(getAccount(), state.selectedMonthKey, false); await persist(); renderAll(); };
+  $('#monthSelect').onchange = async (e) => { state.selectedMonthKey = e.target.value; ensureMonth(getAccount(), state.selectedMonthKey, true); await persist(); renderAll(); };
+  $('#openingBalanceInput').onchange = updateMonthSettings;
+  $('#monthlyTargetInput').onchange = updateAccountSettings;
+  $('#carryOverToggle').onchange = updateMonthSettings;
+  $('#archiveMonthToggle').onchange = updateMonthSettings;
+  $('#saveNotesBtn').onclick = async () => { getMonth().notes = $('#monthNotes').value; await persist(); toast('Notes enregistrées'); };
+
+  $$('.tab-btn').forEach(btn => btn.onclick = () => switchTab(btn.dataset.tab));
+  $$('.mini-tab').forEach(btn => btn.onclick = () => switchFormTab(btn.dataset.formtab));
+
+  $('#incomeForm').onsubmit = onIncomeSubmit;
+  $('#plannedForm').onsubmit = onPlannedSubmit;
+  $('#unexpectedForm').onsubmit = onUnexpectedSubmit;
+  $('#plannedStatusFilter').onchange = renderMonthLists;
+  $('#searchInput').oninput = renderSearchResults;
+  $('#searchTypeFilter').onchange = renderSearchResults;
+  $('#searchCategoryFilter').onchange = renderSearchResults;
+
+  $('#categoryForm').onsubmit = addCategory;
+  $('#exportJsonBtn').onclick = exportJSON;
+  $('#importJsonInput').onchange = importJSON;
+  $('#resetAppBtn').onclick = resetApp;
+  $('#exportCsvBtn').onclick = exportAnnualCSV;
+  $('#printMonthBtn').onclick = () => window.print();
+
+  $('#saveSupabaseConfigBtn').onclick = saveSupabaseConfig;
+  $('#clearSupabaseConfigBtn').onclick = clearSupabaseConfig;
+  $('#authForm').onsubmit = onAuthSubmit;
+  $('#pushCloudBtn').onclick = pushToCloud;
+  $('#pullCloudBtn').onclick = pullFromCloud;
+  $('#logoutCloudBtn').onclick = logoutCloud;
+}
+
+function switchTab(tab) {
+  $$('.tab-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tab));
+  $$('.tab-panel').forEach(panel => panel.classList.toggle('active', panel.id === `tab-${tab}`));
+}
+function switchFormTab(tab) {
+  $$('.mini-tab').forEach(btn => btn.classList.toggle('active', btn.dataset.formtab === tab));
+  $('#incomeForm').classList.toggle('active', tab === 'income');
+  $('#plannedForm').classList.toggle('active', tab === 'planned');
+  $('#unexpectedForm').classList.toggle('active', tab === 'unexpected');
+}
+
+async function addAccount() {
+  const name = prompt('Nom du compte ?');
+  if (!name) return;
+  const acc = defaultAccount(name.trim());
+  state.accounts.push(acc);
+  state.selectedAccountId = acc.id;
+  state.selectedMonthKey = currentMonthKey();
+  await persist();
+  renderAll();
+  toast('Compte créé');
+}
+async function createMonth() {
+  const wanted = prompt('Créer quel mois ? Format AAAA-MM', nextMonthKey(state.selectedMonthKey));
+  if (!wanted || !/^\d{4}-\d{2}$/.test(wanted)) return;
+  ensureMonth(getAccount(), wanted, true);
+  state.selectedMonthKey = wanted;
+  await persist();
+  renderAll();
+  toast('Ligne supprimée');
+}
+
+async function duplicateMonth() {
+  const next = nextMonthKey(state.selectedMonthKey);
+  ensureMonth(getAccount(), next, true);
+  state.selectedMonthKey = next;
+  await persist();
+  renderAll();
+  toast(`Mois ${formatMonth(next)} prêt`);
+}
+async function updateMonthSettings() {
+  const month = getMonth();
+  month.openingBalance = parseAmount($('#openingBalanceInput').value);
+  month.carryOverEnabled = $('#carryOverToggle').checked;
+  month.archived = $('#archiveMonthToggle').checked;
+  recomputeCarryOver(getAccount(), state.selectedMonthKey);
+  await persist();
+  renderAll();
+}
+async function updateAccountSettings() {
+  const acc = getAccount();
+  acc.monthlyTarget = parseAmount($('#monthlyTargetInput').value);
+  await persist();
+  renderAll();
+}
+
+async function onIncomeSubmit(e) {
+  e.preventDefault();
+  const data = new FormData(e.currentTarget);
+  const month = getMonth();
+  month.income.unshift({
+    id: uid(),
+    label: data.get('label'),
+    amount: parseAmount(data.get('amount')),
+    date: data.get('date') || todayISO(),
+    comment: data.get('comment') || ''
   });
-  if (error) {
-    setSyncState("Erreur de sauvegarde", error.message);
-    return toast(error.message);
-  }
-  setSyncState("Synchronisé", `Dernière synchro: ${formatDateTime(new Date())}`);
-  if (forceToast) toast("Sauvegarde cloud effectuée");
+  e.currentTarget.reset();
+  await persist();
+  renderAll();
 }
-
-function scheduleSave(message) {
-  clearTimeout(state.saveTimer);
-  state.saveTimer = setTimeout(() => saveRemote(), 650);
-  render();
-  if (message) setSyncState("Modification locale", `${message}. Sauvegarde en cours...`);
-}
-
-function touchMeta() {
-  if (!state.data.meta) state.data.meta = {};
-  state.data.meta.updatedAt = new Date().toISOString();
-}
-
-function normalizeData() {
-  state.data.categories = Array.isArray(state.data.categories) && state.data.categories.length ? state.data.categories : [...DEFAULT_CATEGORIES];
-  if (!Array.isArray(state.data.accounts) || !state.data.accounts.length) {
-    const replacement = defaultData();
-    state.data.accounts = replacement.accounts;
-  }
-  state.data.accounts.forEach(account => {
-    account.months ||= {};
-    Object.keys(account.months).forEach(month => {
-      const m = account.months[month];
-      m.incomes ||= [];
-      m.planned ||= [];
-      m.unexpected ||= [];
-      m.notes ||= "";
-      if (typeof m.openingBalance !== "number") m.openingBalance = Number(m.openingBalance || 0);
-      if (typeof m.monthlyTarget !== "number") m.monthlyTarget = Number(m.monthlyTarget || account.monthlyTarget || 0);
-    });
+async function onPlannedSubmit(e) {
+  e.preventDefault();
+  const data = new FormData(e.currentTarget);
+  const month = getMonth();
+  month.planned.unshift({
+    id: uid(),
+    label: data.get('label'),
+    amount: parseAmount(data.get('amount')),
+    date: data.get('date') || '',
+    category: data.get('category') || 'Autre',
+    recurring: data.get('recurring') || 'none',
+    comment: data.get('comment') || '',
+    checked: false
   });
+  e.currentTarget.reset();
+  await persist();
+  renderAll();
+}
+async function onUnexpectedSubmit(e) {
+  e.preventDefault();
+  const data = new FormData(e.currentTarget);
+  const month = getMonth();
+  month.unexpected.unshift({
+    id: uid(),
+    label: data.get('label'),
+    amount: parseAmount(data.get('amount')),
+    date: data.get('date') || todayISO(),
+    category: data.get('category') || 'Autre',
+    priority: data.get('priority') || 'normale',
+    comment: data.get('comment') || ''
+  });
+  e.currentTarget.reset();
+  await persist();
+  renderAll();
 }
 
-function getActiveAccount() {
-  return state.data.accounts.find(a => a.id === state.activeAccountId) || state.data.accounts[0];
+function itemMeta(parts) { return parts.filter(Boolean).join(' • '); }
+function actionButton(label, handler, className = 'btn btn-ghost') {
+  const btn = document.createElement('button');
+  btn.className = className;
+  btn.textContent = label;
+  btn.onclick = handler;
+  return btn;
 }
 
-function ensureActiveMonth() {
-  const account = getActiveAccount();
-  if (!account) return;
-  const months = Object.keys(account.months).sort();
-  state.activeMonth ||= months.at(-1) || monthKey(new Date());
-  if (!account.months[state.activeMonth]) account.months[state.activeMonth] = makeEmptyMonth();
-}
-
-function getCurrentMonthData() {
-  const account = getActiveAccount();
-  ensureActiveMonth();
-  return account.months[state.activeMonth];
-}
-
-function computeMonth(account, month) {
-  const m = account.months[month];
-  const incomeTotal = sum(m.incomes, "amount");
-  const plannedPaid = m.planned.filter(x => x.paid).reduce((s, x) => s + Number(x.amount || 0), 0);
-  const plannedTotal = sum(m.planned, "amount");
-  const unexpectedTotal = sum(m.unexpected, "amount");
-  const opening = Number(m.openingBalance || 0);
-  const realRemaining = opening + incomeTotal - plannedPaid - unexpectedTotal;
-  const forecastRemaining = opening + incomeTotal - plannedTotal - unexpectedTotal;
-  const totalSpent = plannedPaid + unexpectedTotal;
-  return { opening, incomeTotal, plannedPaid, plannedTotal, unexpectedTotal, realRemaining, forecastRemaining, totalSpent };
-}
-
-function render() {
-  if (!state.data) return;
-  normalizeData();
+function renderAll() {
   renderSelectors();
-  renderStats();
-  renderLists();
-  renderNotesAndSettings();
+  renderDashboard();
+  renderMonthLists();
+  renderSearchResults();
   renderAnnual();
+  renderArchives();
+  renderSettings();
+  renderCloud();
+  renderStorageInfo();
 }
 
 function renderSelectors() {
-  const accounts = state.data.accounts;
-  els.accountSelect.innerHTML = accounts.map(a => `<option value="${a.id}">${escapeHtml(a.name)}</option>`).join("");
-  els.accountSelect.value = state.activeAccountId;
-  const account = getActiveAccount();
-  const months = Object.keys(account.months).sort();
-  els.monthSelect.innerHTML = months.map(m => `<option value="${m}">${formatMonth(m)}</option>`).join("");
-  if (!months.includes(state.activeMonth)) state.activeMonth = months.at(-1);
-  els.monthSelect.value = state.activeMonth;
-  const options = ['<option value="all">Toutes</option>'].concat(state.data.categories.map(c => `<option value="${escapeAttr(c)}">${escapeHtml(c)}</option>`));
-  els.categoryFilter.innerHTML = options.join("");
-  els.categoryFilter.value = state.filters.category;
-  els.dashboardTitle.textContent = `${account.name} · ${formatMonth(state.activeMonth)}`;
+  const account = getAccount();
+  $('#accountSelect').innerHTML = state.accounts.map(acc => `<option value="${acc.id}" ${acc.id === account.id ? 'selected' : ''}>${escapeHTML(acc.name)}</option>`).join('');
+  const keys = sortedMonthKeys(account.months);
+  keys.forEach(key => ensureMonth(account, key, false));
+  $('#monthSelect').innerHTML = keys.map(key => `<option value="${key}" ${key === state.selectedMonthKey ? 'selected' : ''}>${capitalize(formatMonth(key))}</option>`).join('');
+  $('#heroKicker').textContent = `${account.name} • ${capitalize(formatMonth(state.selectedMonthKey))}`;
 }
 
-function renderStats() {
-  const account = getActiveAccount();
-  const s = computeMonth(account, state.activeMonth);
-  const cards = [
-    ["Solde de départ", money(s.opening)],
-    ["Crédits du mois", money(s.incomeTotal)],
-    ["Dépensé réel", money(s.totalSpent)],
-    ["Restant réel", money(s.realRemaining)],
-    ["Prévu total", money(s.plannedTotal)],
-    ["Imprévues", money(s.unexpectedTotal)],
-    ["Restant prévisionnel", money(s.forecastRemaining)],
-    ["Budget cible", money(getCurrentMonthData().monthlyTarget || 0)]
+function renderDashboard() {
+  const account = getAccount();
+  const month = getMonth();
+  const m = computeMonthMetrics(month);
+  $('#heroTitle').textContent = m.remaining >= 0 ? 'Tu gardes le contrôle de ton mois.' : 'Attention, ton mois est en dépassement.';
+  $('#statRemaining').textContent = formatEuro(m.remaining);
+  $('#statIncome').textContent = formatEuro(m.income);
+  $('#statPlannedPaid').textContent = formatEuro(m.plannedPaid);
+  $('#statUnexpected').textContent = formatEuro(m.unexpected);
+  $('#openingBalanceInput').value = month.openingBalance || 0;
+  $('#monthlyTargetInput').value = account.monthlyTarget || 0;
+  $('#carryOverToggle').checked = !!month.carryOverEnabled;
+  $('#archiveMonthToggle').checked = !!month.archived;
+  $('#monthNotes').value = month.notes || '';
+
+  const badges = [
+    `Solde départ ${formatEuro(month.openingBalance || 0)}`,
+    `Report ${formatEuro(month.carryOverAmount || 0)}`,
+    `${m.paidCount}/${m.plannedCount} prévues payées`,
+    `Prévu restant ${formatEuro(m.pending)}`
   ];
-  els.statsGrid.innerHTML = cards.map(([label, value]) => `<div class="stat-card"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("");
-  const base = Math.max(1, s.opening + s.incomeTotal);
-  const rate = Math.min(100, Math.max(0, Math.round((s.totalSpent / base) * 100)));
-  els.spendRateLabel.textContent = `${rate}%`;
-  els.spendRateBar.style.width = `${rate}%`;
+  $('#monthBadges').innerHTML = badges.map(txt => `<span class="chip">${escapeHTML(txt)}</span>`).join('');
+
+  const max = Math.max(m.available, m.plannedPaid, m.unexpected, Math.abs(m.remaining), 1);
+  $('#flowBars').innerHTML = [
+    ['Entrées disponibles', m.available, ''],
+    ['Prévu payé', m.plannedPaid, ''],
+    ['Imprévus', m.unexpected, m.unexpected > m.available * 0.35 ? 'warning' : ''],
+    ['Restant réel', Math.abs(m.remaining), m.remaining < 0 ? 'danger' : '']
+  ].map(([label, value, tone]) => `
+    <div class="flow-row">
+      <div class="flow-head"><strong>${label}</strong><span>${formatEuro(value)}</span></div>
+      <div class="progress ${tone}"><span style="width:${Math.min(100, (value / max) * 100)}%"></span></div>
+    </div>
+  `).join('');
+
+  renderCategoryBudgetList(account, month);
 }
 
-function renderLists() {
-  const m = getCurrentMonthData();
-  const filterFn = item => {
-    const matchesText = !state.filters.search || [item.label, item.comment, item.category, item.priority, item.date].join(" ").toLowerCase().includes(state.filters.search);
-    const matchesCategory = state.filters.category === "all" || item.category === state.filters.category;
-    const matchesStatus = state.filters.status === "all"
-      || (state.filters.status === "pending" && item.type === "planned" && !item.paid)
-      || (state.filters.status === "paid" && item.type === "planned" && item.paid)
-      || (state.filters.status === "unexpected" && item.type === "unexpected");
-    return matchesText && matchesCategory && matchesStatus;
-  };
-
-  const planned = m.planned.map(i => ({ ...i, type: "planned" })).filter(filterFn).sort((a,b) => (a.date||"").localeCompare(b.date||""));
-  const unexpected = m.unexpected.map(i => ({ ...i, type: "unexpected" })).filter(filterFn);
-  const incomes = m.incomes.filter(i => {
-    const matchesText = !state.filters.search || [i.label, i.comment, i.category, i.date].join(" ").toLowerCase().includes(state.filters.search);
-    const matchesCategory = state.filters.category === "all" || i.category === state.filters.category;
-    return matchesText && matchesCategory;
+function renderCategoryBudgetList(account, month) {
+  const categories = account.categories || [];
+  const totals = {};
+  [...month.planned.filter(x => x.checked), ...month.unexpected].forEach(item => {
+    const cat = item.category || 'Autre';
+    totals[cat] = (totals[cat] || 0) + Number(item.amount || 0);
   });
-
-  els.plannedList.innerHTML = planned.length ? planned.map(itemCard).join("") : emptyState("Aucune dépense prévue pour ce filtre.");
-  els.unexpectedList.innerHTML = unexpected.length ? unexpected.map(itemCard).join("") : emptyState("Aucune dépense imprévue.");
-  els.incomeList.innerHTML = incomes.length ? incomes.map(itemCard).join("") : emptyState("Aucun crédit enregistré.");
-
-  bindListActions();
-}
-
-function itemCard(item) {
-  const amount = money(item.amount || 0);
-  const pills = [
-    item.category ? `<span class="pill">${escapeHtml(item.category)}</span>` : "",
-    item.date ? `<span class="pill">${escapeHtml(item.date)}</span>` : "",
-    item.recurring ? `<span class="pill">Récurrente</span>` : "",
-    item.priority ? `<span class="pill ${item.priority === 'Haute' ? 'danger' : 'warning'}">${escapeHtml(item.priority)}</span>` : "",
-    item.paid ? `<span class="pill success">Payée</span>` : item.type === "planned" ? `<span class="pill warning">À payer</span>` : ""
-  ].join("");
-  return `
-    <article class="item-card">
-      <div class="item-head">
-        <div>
-          <div class="item-title">${escapeHtml(item.label || 'Sans titre')}</div>
-          <div class="item-meta">${pills}</div>
-          ${item.comment ? `<p class="hint" style="margin-top:10px;">${escapeHtml(item.comment)}</p>` : ''}
+  $('#categoryBudgetList').innerHTML = categories.map(cat => {
+    const budget = Number(month.categoryBudgets?.[cat] || 0);
+    const spent = Number(totals[cat] || 0);
+    const pct = budget > 0 ? Math.min(100, (spent / budget) * 100) : 0;
+    const tone = budget > 0 && spent > budget ? 'danger' : budget > 0 && spent > budget * 0.8 ? 'warning' : '';
+    return `
+      <div class="budget-row">
+        <div class="budget-head">
+          <strong>${escapeHTML(cat)}</strong>
+          <span>${formatEuro(spent)}${budget ? ` / ${formatEuro(budget)}` : ''}</span>
         </div>
-        <strong>${amount}</strong>
+        <div class="progress ${tone}"><span style="width:${budget ? pct : 0}%"></span></div>
+        <div class="section-actions wrap">
+          <button class="btn btn-ghost" onclick="setCategoryBudget('${escapeAttr(cat)}')">${budget ? 'Modifier le budget' : 'Définir un budget'}</button>
+        </div>
       </div>
-      <div class="item-actions">
-        ${item.type === 'planned' ? `<button class="secondary" data-action="toggle-paid" data-id="${item.id}">${item.paid ? 'Décocher' : 'Cocher payé'}</button>` : ''}
-        <button class="secondary" data-action="edit-${item.type}" data-id="${item.id}">Modifier</button>
-        <button class="ghost" data-action="delete-${item.type}" data-id="${item.id}">Supprimer</button>
+    `;
+  }).join('') || '<div class="empty-state">Ajoute des catégories pour voir le suivi ici.</div>';
+}
+window.setCategoryBudget = async function (category) {
+  const month = getMonth();
+  const current = Number(month.categoryBudgets?.[category] || 0);
+  const value = prompt(`Budget pour ${category} (€)`, current || '0');
+  if (value === null) return;
+  month.categoryBudgets[category] = parseAmount(value);
+  await persist();
+  renderAll();
+};
+
+function renderMonthLists() {
+  const month = getMonth();
+  const plannedFilter = $('#plannedStatusFilter').value;
+  renderList('#incomeList', month.income, renderIncomeItem, 'Aucune entrée ce mois-ci.');
+  renderList('#plannedList', month.planned.filter(item => plannedFilter === 'all' ? true : plannedFilter === 'done' ? item.checked : !item.checked), renderPlannedItem, 'Aucune dépense prévue.');
+  renderList('#unexpectedList', month.unexpected, renderUnexpectedItem, 'Aucune dépense imprévue.');
+}
+function renderList(selector, items, renderer, emptyText) {
+  const node = $(selector);
+  if (!items.length) {
+    node.className = 'list-block empty-state';
+    node.textContent = emptyText;
+    return;
+  }
+  node.className = 'list-block';
+  node.innerHTML = '';
+  items.forEach(item => node.appendChild(renderer(item)));
+}
+
+function renderIncomeItem(item) {
+  const row = document.createElement('article');
+  row.className = 'item compact';
+  row.innerHTML = `
+    <div class="item-main">
+      <div class="item-title">${escapeHTML(item.label)}</div>
+      <div class="item-meta">${escapeHTML(itemMeta([item.date, item.comment]))}</div>
+    </div>
+    <div class="item-actions">
+      <div class="item-amount">${formatEuro(item.amount)}</div>
+      <button class="btn btn-ghost danger">Supprimer</button>
+    </div>`;
+  row.querySelectorAll('button')[0].onclick = () => editIncome(item.id);
+  row.querySelectorAll('button')[1].onclick = async () => removeItem('income', item.id);
+  return row;
+}
+function renderPlannedItem(item) {
+  const row = document.createElement('article');
+  row.className = 'item';
+  const recurringMap = { monthly: 'mensuel', yearly: 'annuel', none: 'ponctuel' };
+  row.innerHTML = `
+    <input class="check-input" type="checkbox" ${item.checked ? 'checked' : ''} aria-label="Payée" />
+    <div class="item-main">
+      <div class="item-title">${escapeHTML(item.label)}</div>
+      <div class="item-meta">${escapeHTML(itemMeta([item.date || 'sans date', item.category, recurringMap[item.recurring], item.comment]))}</div>
+      <div>${item.checked ? '<span class="badge done">Payée</span>' : '<span class="badge">À payer</span>'}</div>
+    </div>
+    <div class="item-actions">
+      <div class="item-amount">${formatEuro(item.amount)}</div>
+      <button class="btn btn-ghost">Modifier</button>
+      <button class="btn btn-ghost danger">Supprimer</button>
+    </div>`;
+  row.querySelector('.check-input').onchange = async (e) => { item.checked = e.target.checked; await persist(); renderAll(); };
+  row.querySelectorAll('button')[0].onclick = () => editPlanned(item.id);
+  row.querySelectorAll('button')[1].onclick = async () => removeItem('planned', item.id);
+  return row;
+}
+function renderUnexpectedItem(item) {
+  const row = document.createElement('article');
+  row.className = 'item compact';
+  const badgeClass = item.priority === 'urgente' ? 'badge urgent' : item.priority === 'haute' ? 'badge high' : 'badge';
+  row.innerHTML = `
+    <div class="item-main">
+      <div class="item-title">${escapeHTML(item.label)}</div>
+      <div class="item-meta">${escapeHTML(itemMeta([item.date, item.category, item.comment]))}</div>
+      <div><span class="${badgeClass}">${escapeHTML(item.priority || 'normale')}</span></div>
+    </div>
+    <div class="item-actions">
+      <div class="item-amount">${formatEuro(item.amount)}</div>
+      <button class="btn btn-ghost">Modifier</button>
+      <button class="btn btn-ghost danger">Supprimer</button>
+    </div>`;
+  row.querySelectorAll('button')[0].onclick = () => editUnexpected(item.id);
+  row.querySelectorAll('button')[1].onclick = async () => removeItem('unexpected', item.id);
+  return row;
+}
+
+async function removeItem(type, id) {
+  const month = getMonth();
+  if (!confirm('Supprimer cette ligne ?')) return;
+  month[type] = month[type].filter(item => item.id !== id);
+  await persist();
+  renderAll();
+}
+
+async function editIncome(id) {
+  const item = getMonth().income.find(x => x.id === id);
+  if (!item) return;
+  const label = prompt('Libellé du crédit', item.label); if (label === null) return;
+  const amount = prompt('Montant (€)', item.amount); if (amount === null) return;
+  const date = prompt('Date (AAAA-MM-JJ)', item.date || todayISO()); if (date === null) return;
+  const comment = prompt('Commentaire', item.comment || ''); if (comment === null) return;
+  item.label = label.trim();
+  item.amount = parseAmount(amount);
+  item.date = date;
+  item.comment = comment;
+  await persist();
+  renderAll();
+  toast('Crédit modifié');
+}
+
+async function editPlanned(id) {
+  const item = getMonth().planned.find(x => x.id === id);
+  if (!item) return;
+  const label = prompt('Libellé', item.label); if (label === null) return;
+  const amount = prompt('Montant (€)', item.amount); if (amount === null) return;
+  const date = prompt('Date prévue (AAAA-MM-JJ)', item.date || ''); if (date === null) return;
+  const comment = prompt('Commentaire', item.comment || ''); if (comment === null) return;
+  item.label = label.trim(); item.amount = parseAmount(amount); item.date = date; item.comment = comment;
+  await persist(); renderAll();
+  toast('Dépense prévue modifiée');
+}
+
+async function editUnexpected(id) {
+  const item = getMonth().unexpected.find(x => x.id === id);
+  if (!item) return;
+  const label = prompt('Libellé', item.label); if (label === null) return;
+  const amount = prompt('Montant (€)', item.amount); if (amount === null) return;
+  const comment = prompt('Commentaire', item.comment || ''); if (comment === null) return;
+  item.label = label.trim(); item.amount = parseAmount(amount); item.comment = comment;
+  await persist(); renderAll();
+  toast('Dépense imprévue modifiée');
+}
+
+
+function renderSearchResults() {
+  const text = $('#searchInput').value.trim().toLowerCase();
+  const type = $('#searchTypeFilter').value;
+  const category = $('#searchCategoryFilter').value;
+  const month = getMonth();
+  const pack = [
+    ...month.income.map(item => ({ type: 'income', item })),
+    ...month.planned.map(item => ({ type: 'planned', item })),
+    ...month.unexpected.map(item => ({ type: 'unexpected', item })),
+  ].filter(entry => type === 'all' || entry.type === type)
+   .filter(entry => category === 'all' || (entry.item.category || 'all') === category)
+   .filter(entry => !text || JSON.stringify(entry.item).toLowerCase().includes(text));
+
+  const node = $('#searchResults');
+  if (!pack.length) {
+    node.className = 'list-block empty-state';
+    node.textContent = 'Aucun résultat.';
+    return;
+  }
+  node.className = 'list-block';
+  node.innerHTML = pack.map(({ type, item }) => `
+    <article class="item compact">
+      <div class="item-main">
+        <div class="item-title">${escapeHTML(item.label)}</div>
+        <div class="item-meta">${escapeHTML(itemMeta([typeLabel(type), item.category, item.date, item.comment]))}</div>
       </div>
+      <div class="item-amount">${formatEuro(item.amount)}</div>
     </article>
-  `;
+  `).join('');
 }
-
-function bindListActions() {
-  document.querySelectorAll("[data-action]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const { action, id } = btn.dataset;
-      const m = getCurrentMonthData();
-      if (action === "toggle-paid") {
-        const item = m.planned.find(x => x.id === id);
-        item.paid = !item.paid;
-        scheduleSave("Statut modifié");
-        return;
-      }
-      if (action === "edit-planned") return openEntryModal("planned", m.planned.find(x => x.id === id));
-      if (action === "edit-unexpected") return openEntryModal("unexpected", m.unexpected.find(x => x.id === id));
-      if (action === "edit-income") return openEntryModal("income", m.incomes.find(x => x.id === id));
-      if (action === "delete-planned") m.planned = m.planned.filter(x => x.id !== id);
-      if (action === "delete-unexpected") m.unexpected = m.unexpected.filter(x => x.id !== id);
-      if (action === "delete-income") m.incomes = m.incomes.filter(x => x.id !== id);
-      scheduleSave("Ligne supprimée");
-    });
-  });
-}
-
-function renderNotesAndSettings() {
-  const m = getCurrentMonthData();
-  els.monthlyNotes.value = m.notes || "";
-  els.openingBalanceInput.value = Number(m.openingBalance || 0);
-  els.monthlyTargetInput.value = Number(m.monthlyTarget || 0);
-}
+function typeLabel(type) { return ({ income: 'Entrée', planned: 'Prévue', unexpected: 'Imprévue' })[type] || type; }
 
 function renderAnnual() {
-  if (!state.data) return;
-  const account = getActiveAccount();
-  const months = Object.keys(account.months).sort();
-  const year = state.activeMonth?.slice(0,4) || String(new Date().getFullYear());
-  const sameYear = months.filter(m => m.startsWith(year));
-  const rows = sameYear.map(month => ({ month, ...computeMonth(account, month) }));
-  drawChart(rows);
-  const totalIncome = rows.reduce((s,r) => s + r.incomeTotal, 0);
-  const totalSpent = rows.reduce((s,r) => s + r.totalSpent, 0);
-  const avgRemaining = rows.length ? rows.reduce((s,r) => s + r.realRemaining, 0)/rows.length : 0;
-  els.annualSummary.innerHTML = [
-    ["Crédits annuels", money(totalIncome)],
-    ["Dépenses réelles", money(totalSpent)],
-    ["Restant moyen", money(avgRemaining)]
-  ].map(([label, value]) => `<div class="stat-card"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("");
-}
-
-function drawChart(rows) {
-  const canvas = els.annualChart;
-  const ctx = canvas.getContext("2d");
-  const ratio = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth || 800;
-  const h = 240;
-  canvas.width = w * ratio;
-  canvas.height = h * ratio;
-  ctx.scale(ratio, ratio);
-  ctx.clearRect(0,0,w,h);
-  ctx.fillStyle = "rgba(255,255,255,0.08)";
-  ctx.fillRect(0,0,w,h);
-  if (!rows.length) return;
-  const max = Math.max(...rows.map(r => Math.max(r.totalSpent, r.incomeTotal, 1)));
-  const barW = w / (rows.length * 2);
-  rows.forEach((r, i) => {
-    const x = 24 + i * (barW * 2);
-    const spentH = (r.totalSpent / max) * (h - 60);
-    const incomeH = (r.incomeTotal / max) * (h - 60);
-    ctx.fillStyle = "rgba(45,212,191,0.85)";
-    ctx.fillRect(x, h - 28 - incomeH, barW - 6, incomeH);
-    ctx.fillStyle = "rgba(109,140,255,0.9)";
-    ctx.fillRect(x + barW, h - 28 - spentH, barW - 6, spentH);
-    ctx.fillStyle = "rgba(255,255,255,0.9)";
-    ctx.font = "12px sans-serif";
-    ctx.fillText(r.month.slice(5), x, h - 8);
+  const account = getAccount();
+  const year = state.selectedMonthKey.slice(0, 4);
+  const months = Array.from({ length: 12 }, (_, i) => `${year}-${String(i + 1).padStart(2, '0')}`);
+  const rows = months.map(key => {
+    ensureMonth(account, key, false);
+    const metrics = computeMonthMetrics(account.months[key]);
+    return { key, ...metrics };
   });
+  const max = Math.max(...rows.map(r => Math.max(r.income, Math.abs(r.remaining), r.unexpected, r.plannedPaid)), 1);
+  $('#annualBars').innerHTML = rows.map(row => `
+    <div class="annual-row">
+      <div class="annual-head"><strong>${capitalize(monthShortFmt.format(monthToDate(row.key)))}</strong><span>${formatEuro(row.remaining)}</span></div>
+      <div class="progress ${row.remaining < 0 ? 'danger' : ''}"><span style="width:${Math.min(100, (Math.abs(row.remaining) / max) * 100)}%"></span></div>
+      <div class="item-meta">Entrées ${formatEuro(row.income)} • Prévu payé ${formatEuro(row.plannedPaid)} • Imprévus ${formatEuro(row.unexpected)}</div>
+    </div>
+  `).join('');
+
+  const totalIncome = sum(rows, 'income');
+  const totalPaid = sum(rows, 'plannedPaid');
+  const totalUnexpected = sum(rows, 'unexpected');
+  const totalRemaining = sum(rows, 'remaining');
+  $('#annualSummary').innerHTML = [
+    ['Entrées annuelles', totalIncome],
+    ['Prévu payé annuel', totalPaid],
+    ['Imprévus annuels', totalUnexpected],
+    ['Restant cumulé', totalRemaining],
+  ].map(([label, value]) => `<div class="summary-line"><span>${label}</span><strong>${formatEuro(value)}</strong></div>`).join('');
 }
 
-function saveMonthSettings() {
-  const m = getCurrentMonthData();
-  m.openingBalance = Number(els.openingBalanceInput.value || 0);
-  m.monthlyTarget = Number(els.monthlyTargetInput.value || 0);
-  scheduleSave("Paramètres du mois enregistrés");
-}
-
-function duplicateMonthForward() {
-  const account = getActiveAccount();
-  const current = state.activeMonth;
-  const next = nextMonthKey(current);
-  if (account.months[next]) {
-    state.activeMonth = next;
-    render();
-    return toast("Le mois suivant existe déjà");
+function renderArchives() {
+  const account = getAccount();
+  const archived = sortedMonthKeys(account.months)
+    .filter(key => account.months[key].archived)
+    .map(key => ({ key, month: account.months[key], metrics: computeMonthMetrics(account.months[key]) }));
+  const node = $('#archiveList');
+  if (!archived.length) {
+    node.className = 'list-block empty-state';
+    node.textContent = 'Aucun mois archivé.';
+    return;
   }
-  const sourceStats = computeMonth(account, current);
-  const source = getCurrentMonthData();
-  account.months[next] = makeEmptyMonth({
-    carryOver: sourceStats.realRemaining,
-    planned: source.planned,
-    monthlyTarget: source.monthlyTarget
-  });
-  state.activeMonth = next;
-  scheduleSave("Mois suivant créé");
-}
-
-function openAccountModal(existing = null) {
-  const isEdit = !!existing;
-  openModal({
-    title: isEdit ? "Modifier le compte" : "Nouveau compte",
-    body: `
-      <div class="modal-grid">
-        <label><span>Nom du compte</span><input id="modalAccountName" value="${escapeAttr(existing?.name || '')}" /></label>
-        <label><span>Budget mensuel cible</span><input id="modalAccountTarget" type="number" step="0.01" value="${existing?.monthlyTarget || 0}" /></label>
+  node.className = 'list-block';
+  node.innerHTML = archived.map(({ key, metrics }) => `
+    <div class="archive-row item compact">
+      <div class="item-main">
+        <div class="item-title">${capitalize(formatMonth(key))}</div>
+        <div class="item-meta">Restant ${formatEuro(metrics.remaining)} • Entrées ${formatEuro(metrics.income)} • Imprévus ${formatEuro(metrics.unexpected)}</div>
       </div>
-    `,
-    onSave: () => {
-      const name = document.getElementById("modalAccountName").value.trim();
-      const monthlyTarget = Number(document.getElementById("modalAccountTarget").value || 0);
-      if (!name) return toast("Nom du compte requis");
-      if (existing) {
-        existing.name = name;
-        existing.monthlyTarget = monthlyTarget;
-      } else {
-        const id = crypto.randomUUID();
-        const mk = monthKey(new Date());
-        state.data.accounts.push({ id, name, color: "#6d8cff", monthlyTarget, months: { [mk]: makeEmptyMonth() } });
-        state.activeAccountId = id;
-        state.activeMonth = mk;
-      }
-      scheduleSave("Compte enregistré");
-      closeModal();
-    }
-  });
-}
-
-function openCategoriesModal() {
-  openModal({
-    title: "Catégories",
-    body: `
-      <label><span>Liste des catégories (une par ligne)</span>
-        <textarea id="modalCategories" rows="10">${escapeHtml(state.data.categories.join("\n"))}</textarea>
-      </label>
-    `,
-    onSave: () => {
-      const values = document.getElementById("modalCategories").value.split("\n").map(v => v.trim()).filter(Boolean);
-      state.data.categories = [...new Set(values.length ? values : DEFAULT_CATEGORIES)];
-      scheduleSave("Catégories mises à jour");
-      closeModal();
-    }
-  });
-}
-
-function openEntryModal(type, existing = null) {
-  const titleMap = { planned: "Dépense prévue", unexpected: "Dépense imprévue", income: "Crédit" };
-  const categories = state.data.categories.map(c => `<option value="${escapeAttr(c)}" ${existing?.category === c ? 'selected' : ''}>${escapeHtml(c)}</option>`).join("");
-  openModal({
-    title: existing ? `Modifier · ${titleMap[type]}` : `Ajouter · ${titleMap[type]}`,
-    body: `
-      <div class="modal-grid">
-        <label><span>Libellé</span><input id="entryLabel" value="${escapeAttr(existing?.label || '')}" /></label>
-        <label><span>Montant</span><input id="entryAmount" type="number" step="0.01" value="${existing?.amount || ''}" /></label>
-        <label><span>Date prévue / date</span><input id="entryDate" type="date" value="${existing?.date || ''}" /></label>
-        <label><span>Catégorie</span><select id="entryCategory">${categories}</select></label>
-        ${type === 'unexpected' ? `<label><span>Priorité</span><select id="entryPriority"><option ${existing?.priority==='Normale'?'selected':''}>Normale</option><option ${existing?.priority==='Haute'?'selected':''}>Haute</option></select></label>` : ''}
-        ${type === 'planned' ? `<label class="checkbox-row"><input id="entryPaid" type="checkbox" ${existing?.paid ? 'checked' : ''} /> Déjà payée</label>
-        <label class="checkbox-row"><input id="entryRecurring" type="checkbox" ${existing?.recurring ? 'checked' : ''} /> Reporter au mois suivant</label>` : ''}
-      </div>
-      <label style="margin-top:12px; display:block;"><span>Commentaire</span><textarea id="entryComment" rows="4">${escapeHtml(existing?.comment || '')}</textarea></label>
-    `,
-    onSave: () => {
-      const item = {
-        id: existing?.id || crypto.randomUUID(),
-        label: document.getElementById("entryLabel").value.trim(),
-        amount: Number(document.getElementById("entryAmount").value || 0),
-        date: document.getElementById("entryDate").value || "",
-        category: document.getElementById("entryCategory").value || "Divers",
-        comment: document.getElementById("entryComment").value.trim()
-      };
-      if (!item.label || !item.amount) return toast("Libellé et montant requis");
-      if (type === 'planned') {
-        item.paid = document.getElementById("entryPaid").checked;
-        item.recurring = document.getElementById("entryRecurring").checked;
-      }
-      if (type === 'unexpected') item.priority = document.getElementById("entryPriority").value;
-      const m = getCurrentMonthData();
-      const key = type === 'income' ? 'incomes' : type === 'planned' ? 'planned' : 'unexpected';
-      const list = m[key];
-      const idx = list.findIndex(x => x.id === item.id);
-      if (idx >= 0) list[idx] = item; else list.push(item);
-      scheduleSave("Ligne enregistrée");
-      closeModal();
-    }
-  });
-}
-
-function openModal({ title, body, onSave }) {
-  els.modalRoot.innerHTML = `
-    <div class="modal-backdrop" id="modalBackdrop">
-      <div class="modal">
-        <div class="section-head compact"><h2>${title}</h2></div>
-        ${body}
-        <div class="modal-footer">
-          <button class="secondary" id="modalCancel">Annuler</button>
-          <button id="modalSave">Enregistrer</button>
-        </div>
+      <div class="item-actions">
+        <button class="btn btn-ghost" onclick="openArchivedMonth('${key}')">Ouvrir</button>
       </div>
     </div>
-  `;
-  document.getElementById("modalCancel").addEventListener("click", closeModal);
-  document.getElementById("modalBackdrop").addEventListener("click", e => { if (e.target.id === 'modalBackdrop') closeModal(); });
-  document.getElementById("modalSave").addEventListener("click", onSave);
+  `).join('');
 }
+window.openArchivedMonth = async function (key) {
+  state.selectedMonthKey = key;
+  await persist();
+  renderAll();
+  switchTab('month');
+};
 
-function closeModal() { els.modalRoot.innerHTML = ""; }
-
-function exportJson() {
-  const blob = new Blob([JSON.stringify(state.data, null, 2)], { type: "application/json" });
-  downloadBlob(blob, `budget-flow-cloud-${state.activeMonth}.json`);
-}
-
-function importJson(event) {
-  const file = event.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = async () => {
-    try {
-      state.data = JSON.parse(reader.result);
-      normalizeData();
-      state.activeAccountId = state.data.accounts[0]?.id;
-      ensureActiveMonth();
-      render();
-      await saveRemote(true);
-      toast("JSON importé et synchronisé");
-    } catch {
-      toast("Fichier JSON invalide");
-    }
-  };
-  reader.readAsText(file);
-}
-
-function exportAnnualCsv() {
-  const account = getActiveAccount();
-  const year = state.activeMonth.slice(0,4);
-  const rows = Object.keys(account.months).sort().filter(m => m.startsWith(year)).map(month => {
-    const s = computeMonth(account, month);
-    return [month, s.opening, s.incomeTotal, s.plannedTotal, s.plannedPaid, s.unexpectedTotal, s.totalSpent, s.realRemaining].join(",");
+function renderSettings() {
+  const acc = getAccount();
+  const month = getMonth();
+  const categories = acc.categories;
+  const categoryOptions = ['<option value="all">Toutes</option>', ...categories.map(c => `<option value="${escapeAttr(c)}">${escapeHTML(c)}</option>`)].join('');
+  $('#searchCategoryFilter').innerHTML = categoryOptions;
+  document.querySelectorAll('select[name="category"]').forEach(sel => {
+    const current = sel.value;
+    sel.innerHTML = categories.map(c => `<option value="${escapeAttr(c)}">${escapeHTML(c)}</option>`).join('');
+    if (categories.includes(current)) sel.value = current;
   });
-  const csv = ["mois,solde_depart,credits,prevu_total,prevu_paye,imprevues,depense_reelle,restant_reel", ...rows].join("\n");
-  downloadBlob(new Blob([csv], { type: "text/csv;charset=utf-8" }), `budget-flow-${account.name}-${year}.csv`);
+
+  $('#categoryTags').innerHTML = categories.map(cat => `
+    <span class="tag">${escapeHTML(cat)} <button onclick="removeCategory('${escapeAttr(cat)}')">×</button></span>
+  `).join('');
+
+  $('#accountCards').innerHTML = state.accounts.map(account => {
+    const selected = account.id === acc.id;
+    return `
+      <div class="account-card">
+        <header>
+          <strong>${escapeHTML(account.name)}</strong>
+          <span>${selected ? 'Sélectionné' : ''}</span>
+        </header>
+        <div class="item-meta">${Object.keys(account.months).length} mois • ${account.categories.length} catégories</div>
+        <div class="section-actions wrap">
+          <button class="btn btn-ghost" onclick="renameAccount('${account.id}')">Renommer</button>
+          <button class="btn btn-ghost ${selected ? 'hidden' : ''}" onclick="selectAccount('${account.id}')">Choisir</button>
+          <button class="btn btn-ghost danger" onclick="deleteAccount('${account.id}')" ${state.accounts.length === 1 ? 'disabled' : ''}>Supprimer</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+window.renameAccount = async function (id) {
+  const account = state.accounts.find(a => a.id === id); if (!account) return;
+  const name = prompt('Nouveau nom du compte', account.name); if (!name) return;
+  account.name = name.trim(); await persist(); renderAll();
+};
+window.selectAccount = async function (id) { state.selectedAccountId = id; await persist(); renderAll(); };
+window.deleteAccount = async function (id) {
+  if (state.accounts.length === 1) return;
+  if (!confirm('Supprimer ce compte et tous ses mois ?')) return;
+  state.accounts = state.accounts.filter(a => a.id !== id);
+  state.selectedAccountId = state.accounts[0].id;
+  await persist(); renderAll();
+};
+window.removeCategory = async function (category) {
+  const acc = getAccount();
+  if (!confirm(`Supprimer la catégorie ${category} ?`)) return;
+  acc.categories = acc.categories.filter(c => c !== category);
+  Object.values(acc.months).forEach(month => {
+    delete month.categoryBudgets[category];
+    month.planned.forEach(item => { if (item.category === category) item.category = 'Autre'; });
+    month.unexpected.forEach(item => { if (item.category === category) item.category = 'Autre'; });
+  });
+  if (!acc.categories.includes('Autre')) acc.categories.push('Autre');
+  await persist(); renderAll();
+};
+async function addCategory(e) {
+  e.preventDefault();
+  const input = $('#newCategoryInput');
+  const value = input.value.trim();
+  if (!value) return;
+  const acc = getAccount();
+  if (!acc.categories.includes(value)) acc.categories.push(value);
+  input.value = '';
+  await persist();
+  renderAll();
 }
 
-function setSyncState(label, text) {
-  els.syncStateLabel.textContent = label;
-  els.syncStateText.textContent = text;
+function renderCloud() {
+  $('#supabaseUrlInput').value = state.settings.supabaseUrl || '';
+  $('#supabaseAnonKeyInput').value = state.settings.supabaseAnonKey || '';
+  const user = supabaseClient?.auth ? null : null;
+  $('#cloudStatusBox').innerHTML = `
+    <strong>Mode actuel :</strong> ${state.settings.cloudEnabled ? 'Cloud prêt' : 'Local uniquement'}<br>
+    <strong>Dernière synchro :</strong> ${state.settings.lastCloudSyncAt ? new Date(state.settings.lastCloudSyncAt).toLocaleString('fr-FR') : 'Jamais'}<br>
+    <strong>Fonctionnement :</strong> les données restent d’abord dans IndexedDB, puis tu peux envoyer ou récupérer un snapshot complet.
+  `;
+}
+async function saveSupabaseConfig() {
+  state.settings.supabaseUrl = $('#supabaseUrlInput').value.trim();
+  state.settings.supabaseAnonKey = $('#supabaseAnonKeyInput').value.trim();
+  state.settings.cloudEnabled = !!(state.settings.supabaseUrl && state.settings.supabaseAnonKey);
+  maybeInitSupabase();
+  await persist();
+  renderCloud();
+  toast(state.settings.cloudEnabled ? 'Configuration cloud enregistrée' : 'Configuration vide');
+}
+async function clearSupabaseConfig() {
+  state.settings.supabaseUrl = '';
+  state.settings.supabaseAnonKey = '';
+  state.settings.cloudEnabled = false;
+  supabaseClient = null;
+  await persist();
+  renderCloud();
+  toast('Configuration cloud effacée');
+}
+function maybeInitSupabase() {
+  if (!state.settings.supabaseUrl || !state.settings.supabaseAnonKey || !window.supabase?.createClient) return;
+  try {
+    supabaseClient = window.supabase.createClient(state.settings.supabaseUrl, state.settings.supabaseAnonKey);
+  } catch (err) {
+    console.error(err);
+    toast('Configuration Supabase invalide');
+  }
+}
+async function onAuthSubmit(e) {
+  e.preventDefault();
+  if (!supabaseClient) return toast('Enregistre d’abord ta configuration Supabase');
+  const data = new FormData(e.currentTarget);
+  const email = data.get('email');
+  const password = data.get('password');
+  const action = e.submitter?.value;
+  try {
+    if (action === 'signup') {
+      const { error } = await supabaseClient.auth.signUp({ email, password });
+      if (error) throw error;
+      toast('Compte créé. Vérifie ton email si une confirmation est demandée.');
+    } else if (action === 'signin') {
+      const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+      if (error) throw error;
+      toast('Connectée au cloud');
+    } else {
+      const { error } = await supabaseClient.auth.resetPasswordForEmail(email);
+      if (error) throw error;
+      toast('Email de réinitialisation envoyé');
+    }
+  } catch (err) {
+    console.error(err);
+    toast(err.message || 'Erreur d’authentification');
+  }
+}
+async function requireCloudUser() {
+  if (!supabaseClient) throw new Error('Configuration Supabase absente');
+  const { data, error } = await supabaseClient.auth.getUser();
+  if (error) throw error;
+  if (!data.user) throw new Error('Connecte-toi d’abord au cloud');
+  return data.user;
+}
+async function pushToCloud() {
+  try {
+    const user = await requireCloudUser();
+    const payload = clone(state);
+    const { error } = await supabaseClient.from('budget_snapshots').upsert({ user_id: user.id, payload, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+    if (error) throw error;
+    state.settings.lastCloudSyncAt = new Date().toISOString();
+    await persist();
+    renderCloud();
+    toast('Sauvegarde cloud effectuée');
+  } catch (err) {
+    console.error(err);
+    toast(err.message || 'Échec de la sauvegarde cloud');
+  }
+}
+async function pullFromCloud() {
+  try {
+    const user = await requireCloudUser();
+    const { data, error } = await supabaseClient.from('budget_snapshots').select('payload, updated_at').eq('user_id', user.id).single();
+    if (error) throw error;
+    if (!data?.payload) throw new Error('Aucune sauvegarde cloud trouvée');
+    Object.assign(state, data.payload);
+    state.settings.lastCloudSyncAt = new Date().toISOString();
+    maybeInitSupabase();
+    await persist();
+    renderAll();
+    toast('Données récupérées depuis le cloud');
+  } catch (err) {
+    console.error(err);
+    toast(err.message || 'Échec de la récupération cloud');
+  }
+}
+async function logoutCloud() {
+  if (!supabaseClient) return;
+  await supabaseClient.auth.signOut();
+  toast('Déconnectée du cloud');
 }
 
-function sum(arr, key) { return arr.reduce((s, x) => s + Number(x[key] || 0), 0); }
-function money(n) { return new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(Number(n || 0)); }
-function monthKey(date) { return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}`; }
-function nextMonthKey(month) {
-  const [y,m] = month.split("-").map(Number);
-  const d = new Date(y, m, 1);
-  return monthKey(d);
+function exportJSON() {
+  const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+  downloadBlob(blob, `budget-flow-v4-${state.selectedMonthKey}.json`);
 }
-function formatMonth(key) {
-  const [y,m] = key.split("-").map(Number);
-  return new Intl.DateTimeFormat("fr-FR", { month: "long", year: "numeric" }).format(new Date(y, m-1, 1));
+async function importJSON(e) {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  try {
+    const parsed = JSON.parse(await file.text());
+    if (!parsed.accounts?.length) throw new Error('Fichier invalide');
+    Object.assign(state, parsed);
+    maybeInitSupabase();
+    await persist();
+    renderAll();
+    toast('Import réussi');
+  } catch (err) {
+    toast(err.message || 'Import impossible');
+  } finally {
+    e.target.value = '';
+  }
 }
-function formatDateTime(value) { return new Intl.DateTimeFormat("fr-FR", { dateStyle: "short", timeStyle: "short" }).format(new Date(value)); }
-function emptyState(label) { return `<div class="info-card">${label}</div>`; }
+async function resetApp() {
+  if (!confirm('Réinitialiser complètement l’application ?')) return;
+  await idb.clear();
+  Object.assign(state, {
+    theme: 'dark',
+    settings: { supabaseUrl: '', supabaseAnonKey: '', cloudEnabled: false, lastCloudSyncAt: null, lastLocalSaveAt: null },
+    selectedAccountId: null,
+    selectedMonthKey: currentMonthKey(),
+    accounts: [defaultAccount()]
+  });
+  state.selectedAccountId = state.accounts[0].id;
+  supabaseClient = null;
+  await persist();
+  renderAll();
+  toast('Application réinitialisée');
+}
+function exportAnnualCSV() {
+  const account = getAccount();
+  const year = state.selectedMonthKey.slice(0, 4);
+  const rows = [['mois', 'entrees', 'prevu_paye', 'imprevus', 'restant']];
+  for (let i = 1; i <= 12; i++) {
+    const key = `${year}-${String(i).padStart(2, '0')}`;
+    ensureMonth(account, key, false);
+    const m = computeMonthMetrics(account.months[key]);
+    rows.push([key, m.income, m.plannedPaid, m.unexpected, m.remaining]);
+  }
+  const csv = rows.map(r => r.join(';')).join('\n');
+  downloadBlob(new Blob([csv], { type: 'text/csv;charset=utf-8' }), `budget-flow-${account.name}-${year}.csv`);
+}
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
+  const a = document.createElement('a');
   a.href = url; a.download = filename; a.click();
   URL.revokeObjectURL(url);
 }
-function toast(message) {
-  els.toast.textContent = message;
-  els.toast.classList.remove("hidden");
-  clearTimeout(els.toast._t);
-  els.toast._t = setTimeout(() => els.toast.classList.add("hidden"), 2600);
-}
-function escapeHtml(value = "") { return String(value).replace(/[&<>"']/g, m => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m])); }
-function escapeAttr(value = "") { return escapeHtml(value); }
 
-function registerServiceWorker() {
-  if ("serviceWorker" in navigator) navigator.serviceWorker.register("./service-worker.js").catch(() => {});
+function renderStorageInfo() {
+  $('#storageInfo').innerHTML = `
+    <strong>Stockage :</strong> IndexedDB locale dans le navigateur<br>
+    <strong>Dernière sauvegarde locale :</strong> ${state.settings.lastLocalSaveAt ? new Date(state.settings.lastLocalSaveAt).toLocaleString('fr-FR') : 'Jamais'}<br>
+    <strong>Mode :</strong> ${state.settings.cloudEnabled ? 'Local + cloud optionnel' : 'Local uniquement'}
+  `;
 }
+
+function toast(message) {
+  const node = $('#toast');
+  node.textContent = message;
+  node.classList.remove('hidden');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => node.classList.add('hidden'), 2600);
+}
+function capitalize(str) { return str ? str.charAt(0).toUpperCase() + str.slice(1) : ''; }
+function escapeHTML(str = '') {
+  return String(str).replace(/[&<>'"]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
+}
+function escapeAttr(str = '') { return String(str).replace(/'/g, '&#39;'); }
+
+function registerPWA() {
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./service-worker.js').catch(console.error);
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredPrompt = e;
+    $('#installBtn').classList.remove('hidden');
+  });
+  $('#installBtn').onclick = async () => {
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    deferredPrompt = null;
+    $('#installBtn').classList.add('hidden');
+  };
+}
+
+bootstrap();
