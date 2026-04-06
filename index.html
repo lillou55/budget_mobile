@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#111827" />
+    <title>Budget Flow Cloud</title>
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar glass">
+        <div>
+          <p class="eyebrow">Budget Flow Cloud</p>
+          <h1>Budget mobile synchronisé</h1>
+        </div>
+        <div class="topbar-actions">
+          <button id="themeToggle" class="icon-btn" title="Changer le thème">◐</button>
+          <button id="signOutBtn" class="secondary hidden">Déconnexion</button>
+        </div>
+      </header>
+
+      <main>
+        <section id="authView" class="auth-layout">
+          <div class="hero-card glass">
+            <p class="eyebrow">Sans installation serveur</p>
+            <h2>Une seule base Supabase pour ton téléphone et ta page web</h2>
+            <p>
+              L’application enregistre les données directement en ligne dans Supabase.
+              Tu retrouves les mêmes comptes, mois et dépenses sur tous tes appareils.
+            </p>
+            <ul class="hero-list">
+              <li>connexion email / mot de passe</li>
+              <li>synchronisation cloud</li>
+              <li>plusieurs comptes et plusieurs mois</li>
+              <li>duplication automatique du mois suivant</li>
+            </ul>
+          </div>
+
+          <div class="auth-card glass">
+            <h3>Connexion Supabase</h3>
+            <div class="stack gap12">
+              <label>
+                <span>Project URL</span>
+                <input id="supabaseUrl" type="url" placeholder="https://xxxx.supabase.co" />
+              </label>
+              <label>
+                <span>Anon key</span>
+                <textarea id="supabaseAnonKey" rows="4" placeholder="Ta clé publique anon"></textarea>
+              </label>
+              <div class="inline-actions">
+                <button id="saveConfigBtn" class="secondary">Enregistrer la config</button>
+                <button id="testConfigBtn" class="ghost">Tester</button>
+              </div>
+            </div>
+
+            <div class="separator"></div>
+
+            <div class="stack gap12">
+              <label>
+                <span>Email</span>
+                <input id="emailInput" type="email" placeholder="toi@email.com" />
+              </label>
+              <label>
+                <span>Mot de passe</span>
+                <input id="passwordInput" type="password" placeholder="••••••••" />
+              </label>
+              <div class="inline-actions auth-actions">
+                <button id="signInBtn">Se connecter</button>
+                <button id="signUpBtn" class="secondary">Créer un compte</button>
+              </div>
+            </div>
+
+            <p class="hint">
+              L’app utilise uniquement Supabase pour les données budget. Pas d’IndexedDB pour les comptes et dépenses.
+            </p>
+          </div>
+        </section>
+
+        <section id="appView" class="hidden">
+          <div class="dashboard-grid">
+            <section class="panel glass stats-panel">
+              <div class="section-head">
+                <div>
+                  <p class="eyebrow">Tableau de bord</p>
+                  <h2 id="dashboardTitle">Chargement...</h2>
+                </div>
+                <div class="inline-actions wrap">
+                  <button id="syncNowBtn" class="secondary">Synchroniser</button>
+                  <button id="duplicateMonthBtn" class="ghost">Créer le mois suivant</button>
+                  <button id="newAccountBtn">Nouveau compte</button>
+                </div>
+              </div>
+              <div class="chips-row">
+                <label class="chip-select">
+                  <span>Compte</span>
+                  <select id="accountSelect"></select>
+                </label>
+                <label class="chip-select">
+                  <span>Mois</span>
+                  <select id="monthSelect"></select>
+                </label>
+              </div>
+              <div class="stats-grid" id="statsGrid"></div>
+              <div class="progress-block">
+                <div class="progress-head">
+                  <span>Taux de dépenses du mois</span>
+                  <strong id="spendRateLabel">0%</strong>
+                </div>
+                <div class="progress-bar"><span id="spendRateBar"></span></div>
+              </div>
+            </section>
+
+            <section class="panel glass quick-panel">
+              <div class="section-head compact">
+                <div>
+                  <p class="eyebrow">Actions rapides</p>
+                  <h2>Ajouter et filtrer</h2>
+                </div>
+              </div>
+              <div class="quick-actions-grid">
+                <button id="addIncomeBtn" class="quick-btn">+ Crédit</button>
+                <button id="addPlannedBtn" class="quick-btn">+ Prévue</button>
+                <button id="addUnexpectedBtn" class="quick-btn">+ Imprévue</button>
+                <button id="manageCategoriesBtn" class="quick-btn">Catégories</button>
+              </div>
+              <div class="filter-grid">
+                <label>
+                  <span>Recherche</span>
+                  <input id="searchInput" type="search" placeholder="course, loyer, EDF..." />
+                </label>
+                <label>
+                  <span>Catégorie</span>
+                  <select id="categoryFilter"></select>
+                </label>
+                <label>
+                  <span>Statut</span>
+                  <select id="statusFilter">
+                    <option value="all">Tout</option>
+                    <option value="pending">Prévues non payées</option>
+                    <option value="paid">Prévues payées</option>
+                    <option value="unexpected">Imprévues</option>
+                  </select>
+                </label>
+              </div>
+            </section>
+          </div>
+
+          <section class="tabs glass">
+            <button class="tab-btn active" data-tab="overviewTab">Mois</button>
+            <button class="tab-btn" data-tab="annualTab">Année</button>
+            <button class="tab-btn" data-tab="notesTab">Notes</button>
+            <button class="tab-btn" data-tab="settingsTab">Compte</button>
+          </section>
+
+          <section id="overviewTab" class="tab-panel active">
+            <div class="two-col">
+              <section class="panel glass">
+                <div class="section-head compact">
+                  <div>
+                    <p class="eyebrow">Prévisionnel</p>
+                    <h2>Dépenses prévues</h2>
+                  </div>
+                  <button id="addPlannedBtn2" class="secondary">Ajouter</button>
+                </div>
+                <div id="plannedList" class="list-stack"></div>
+              </section>
+
+              <section class="panel glass">
+                <div class="section-head compact">
+                  <div>
+                    <p class="eyebrow">Suivi réel</p>
+                    <h2>Dépenses imprévues & crédits</h2>
+                  </div>
+                  <div class="inline-actions wrap">
+                    <button id="addIncomeBtn2" class="secondary">Crédit</button>
+                    <button id="addUnexpectedBtn2">Imprévue</button>
+                  </div>
+                </div>
+                <div class="subsection">
+                  <h3>Crédits</h3>
+                  <div id="incomeList" class="list-stack"></div>
+                </div>
+                <div class="subsection">
+                  <h3>Imprévues</h3>
+                  <div id="unexpectedList" class="list-stack"></div>
+                </div>
+              </section>
+            </div>
+          </section>
+
+          <section id="annualTab" class="tab-panel">
+            <section class="panel glass">
+              <div class="section-head compact">
+                <div>
+                  <p class="eyebrow">Vision large</p>
+                  <h2>Vue annuelle</h2>
+                </div>
+                <div class="inline-actions wrap">
+                  <button id="exportJsonBtn" class="secondary">Exporter JSON</button>
+                  <button id="exportCsvBtn" class="ghost">Exporter CSV annuel</button>
+                </div>
+              </div>
+              <canvas id="annualChart" height="240"></canvas>
+              <div id="annualSummary" class="annual-summary"></div>
+            </section>
+          </section>
+
+          <section id="notesTab" class="tab-panel">
+            <section class="panel glass">
+              <div class="section-head compact">
+                <div>
+                  <p class="eyebrow">Notes</p>
+                  <h2>Commentaires du mois</h2>
+                </div>
+              </div>
+              <textarea id="monthlyNotes" rows="10" placeholder="Notes libres, rappels, points d’attention..."></textarea>
+            </section>
+          </section>
+
+          <section id="settingsTab" class="tab-panel">
+            <div class="two-col">
+              <section class="panel glass">
+                <div class="section-head compact">
+                  <div>
+                    <p class="eyebrow">Compte courant</p>
+                    <h2>Paramètres du mois</h2>
+                  </div>
+                </div>
+                <div class="form-grid">
+                  <label>
+                    <span>Solde de départ</span>
+                    <input id="openingBalanceInput" type="number" step="0.01" />
+                  </label>
+                  <label>
+                    <span>Budget mensuel cible</span>
+                    <input id="monthlyTargetInput" type="number" step="0.01" />
+                  </label>
+                </div>
+                <div class="inline-actions">
+                  <button id="saveMonthSettingsBtn">Enregistrer</button>
+                </div>
+              </section>
+
+              <section class="panel glass">
+                <div class="section-head compact">
+                  <div>
+                    <p class="eyebrow">Cloud</p>
+                    <h2>Synchronisation Supabase</h2>
+                  </div>
+                </div>
+                <div class="stack gap12">
+                  <div class="info-card">
+                    <strong id="syncStateLabel">Non synchronisé</strong>
+                    <p id="syncStateText">Connecte-toi pour charger tes données.</p>
+                  </div>
+                  <div class="inline-actions wrap">
+                    <button id="reloadCloudBtn" class="secondary">Recharger depuis le cloud</button>
+                    <button id="saveCloudBtn">Forcer la sauvegarde</button>
+                  </div>
+                  <label>
+                    <span>Importer un JSON</span>
+                    <input id="importJsonInput" type="file" accept="application/json" />
+                  </label>
+                </div>
+              </section>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <div id="modalRoot"></div>
+    <div id="toast" class="toast hidden"></div>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
